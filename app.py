@@ -1,13 +1,11 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import time
-import matplotlib.pyplot as plt
 
 from nltk.stem import PorterStemmer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-
+from sklearn.model_selection import train_test_split
 
 # ==========================================
 # KONFIGURASI HALAMAN & STATE
@@ -24,32 +22,33 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "view_mode" not in st.session_state:
     st.session_state.view_mode = "home" # "home", "search_result", "detail"
-if "detail_idx" not in st.session_state:
-    st.session_state.detail_idx = None
+if "detail_item" not in st.session_state:
+    st.session_state.detail_item = None # format: {"source": "train"/"test", "idx": idx}
 if "search_result_data" not in st.session_state:
     st.session_state.search_result_data = None
 
-def set_detail_view(idx):
-    st.session_state.detail_idx = idx
+def set_detail_view(source, idx):
+    item = {"source": source, "idx": idx}
+    st.session_state.detail_item = item
     st.session_state.view_mode = "detail"
+    
     # Tambahkan ke riwayat jika belum ada / naikkan ke atas
-    if idx in st.session_state.history:
-        st.session_state.history.remove(idx)
-    st.session_state.history.insert(0, idx)
+    if item in st.session_state.history:
+        st.session_state.history.remove(item)
+    st.session_state.history.insert(0, item)
     if len(st.session_state.history) > 6:
         st.session_state.history = st.session_state.history[:6]
 
 def set_home_view():
     st.session_state.view_mode = "home"
-    st.session_state.detail_idx = None
+    st.session_state.detail_item = None
 
 # ==========================================
-# CSS (DIREVISI UNTUK GRID PRESISI)
+# CSS 
 # ==========================================
 
 st.markdown("""
 <style>
-/* Mengunci tinggi judul maksimal 2 baris agar tombol sejajar */
 .book-title {
     font-size: 14px;
     font-weight: bold;
@@ -61,8 +60,6 @@ st.markdown("""
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
 }
-
-/* Mengunci tinggi penulis maksimal 1 baris, teks lebih akan menjadi "..." */
 .book-author {
     font-size: 12px;
     color: gray;
@@ -73,8 +70,6 @@ st.markdown("""
     white-space: nowrap;
     text-overflow: ellipsis;
 }
-
-/* Mengunci tinggi rating */
 .book-rating {
     color: orange;
     font-weight: bold;
@@ -83,30 +78,31 @@ st.markdown("""
     font-size: 13px;
     height: 20px;
 }
-
 img {
     border-radius: 8px;
 }
 </style>
 """, unsafe_allow_html=True)
 
+
 # ==========================================
-# LOAD DATA
+# LOAD DATA & PREPROCESSING (TRAIN-TEST SPLIT)
 # ==========================================
 
 @st.cache_data
-def load_data():
+def load_and_preprocess_data():
     df = pd.read_csv("fix.csv")
 
-    # Pastikan kolom thumbnail dan rating terbawa
+    # Ambil kolom yang dibutuhkan (termasuk visual/UI)
     data = df[['title', 'authors', 'categories', 'description', 'thumbnail', 'average_rating', 'ratings_count']]
     
-    # Konversi rating ke numerik, yang error atau kosong jadikan 0
+    # Konversi rating ke numerik
     data['average_rating'] = pd.to_numeric(data['average_rating'], errors='coerce').fillna(0)
     data['ratings_count'] = pd.to_numeric(data['ratings_count'], errors='coerce').fillna(0)
     
     data = data.fillna('')
 
+    # Penggabungan fitur teks
     data['combined'] = (
         data['title'].astype(str) + " " +
         data['authors'].astype(str) + " " +
@@ -117,22 +113,31 @@ def load_data():
     data['combined'] = data['combined'].str.lower()
     data['tokens'] = data['combined'].apply(lambda x: x.split())
 
+    # Stopwords
     stopwords = ['and', 'a', 'about', 'the', 'of', 'is', 'that']
     data['filtered'] = data['tokens'].apply(lambda x: [w for w in x if w not in stopwords])
 
+    # Stemming
     stemmer = PorterStemmer()
     data['stemmed'] = data['filtered'].apply(lambda x: [stemmer.stem(word) for word in x])
     data['final'] = data['stemmed'].apply(lambda x: ' '.join(x))
 
-    return data
+    # Split Data (80% Train, 20% Test)
+    train_data, test_data = train_test_split(data, test_size=0.2, random_state=42)
+    
+    train_data = train_data.reset_index(drop=True)
+    test_data = test_data.reset_index(drop=True)
+    
+    return train_data, test_data
 
 
 # ==========================================
-# TF-IDF DAN COSINE
+# TF-IDF DAN COSINE SIMILARITY
 # ==========================================
 
 @st.cache_resource
-def build_model(data):
+def build_model(train_df, test_df):
+    # Menggunakan hyperparameter
     tfidf = TfidfVectorizer(
         stop_words='english',
         max_features=5000,
@@ -140,94 +145,60 @@ def build_model(data):
         min_df=2,
         max_df=0.8
     )
-    tfidf_matrix = tfidf.fit_transform(data['final'])
-    cosine_sim = cosine_similarity(tfidf_matrix)
+    
+    # Fit pada Train, Transform pada Test
+    tfidf_train = tfidf.fit_transform(train_df['final'])
+    tfidf_test = tfidf.transform(test_df['final'])
+    
+    # Hitung Cosine Similarity antara Test dan Train
+    cosine_sim = cosine_similarity(tfidf_test, tfidf_train)
+    
     return cosine_sim
 
 
 # ==========================================
-# REKOMENDASI
+# REKOMENDASI (DIPERBAIKI UNTUK TANDA TANYA)
 # ==========================================
 
-def rekomendasi(judul, data, cosine_sim, k):
+def rekomendasi(judul, train_df, test_df, cosine_sim, k):
+    # Membersihkan input judul
     judul = str(judul).strip().lower()
-    data['title_clean'] = data['title'].astype(str).str.lower()
-    hasil = data[data['title_clean'].str.contains(judul, na=False)]
+    test_df['title_clean'] = test_df['title'].astype(str).str.lower()
+    
+    # Gunakan exact match (==) agar karakter Regex seperti "?" tidak menyebabkan error
+    hasil = test_df[test_df['title_clean'] == judul]
 
     if hasil.empty:
         return None
 
+    # Ambil index buku di test_data
     idx = hasil.index[0]
+    
+    # Ambil skor similarity (array 1D sebesar jumlah train_data)
     skor = list(enumerate(cosine_sim[idx]))
     skor = sorted(skor, key=lambda x: x[1], reverse=True)
 
     hasil_rekom = []
-    for i, score in skor[1:k+1]:
+    # Ambil top K rekomendasi dari train_data
+    for i, score in skor[:k]:
         hasil_rekom.append({
-            "Index": i,
-            "Judul": data.loc[i, 'title'],
-            "Penulis": data.loc[i, 'authors'],
-            "Kategori": data.loc[i, 'categories'],
+            "Index": i, # Index di train_data
+            "Judul": train_df.loc[i, 'title'],
+            "Penulis": train_df.loc[i, 'authors'],
+            "Kategori": train_df.loc[i, 'categories'],
             "Similarity": round(score, 3),
-            "Thumbnail": data.loc[i, 'thumbnail'],
-            "Rating": data.loc[i, 'average_rating']
+            "Thumbnail": train_df.loc[i, 'thumbnail'],
+            "Rating": train_df.loc[i, 'average_rating']
         })
 
     return idx, hasil_rekom
 
 
 # ==========================================
-# METRIK EVALUASI
-# ==========================================
-
-def precision_at_k(idx, cosine_sim, data, k=3):
-    skor = list(enumerate(cosine_sim[idx]))
-    skor = sorted(skor, key=lambda x: x[1], reverse=True)
-    rekom = [i[0] for i in skor[1:k+1]]
-    kategori_asli = set(str(data.loc[idx, 'categories']).lower().split())
-    relevan = 0
-    for i in rekom:
-        kategori_rekom = set(str(data.loc[i, 'categories']).lower().split())
-        if len(kategori_asli & kategori_rekom) > 0:
-            relevan += 1
-    return relevan / k
-
-def ndcg_at_k(idx, cosine_sim, data, k=3):
-    skor = list(enumerate(cosine_sim[idx]))
-    skor = sorted(skor, key=lambda x: x[1], reverse=True)
-    rekom = [i[0] for i in skor[1:k+1]]
-    kategori_asli = set(str(data.loc[idx, 'categories']).lower().split())
-    relevansi = []
-    for i in rekom:
-        kategori_rekom = set(str(data.loc[i, 'categories']).lower().split())
-        rel = 1 if len(kategori_asli & kategori_rekom) > 0 else 0
-        relevansi.append(rel)
-    dcg = sum([rel / np.log2(pos + 2) for pos, rel in enumerate(relevansi)])
-    ideal = sorted(relevansi, reverse=True)
-    idcg = sum([rel / np.log2(pos + 2) for pos, rel in enumerate(ideal)])
-    if idcg == 0:
-        return 0
-    return dcg / idcg
-
-def evaluasi_sistem(data, cosine_sim, k=3):
-    start = time.time()
-    total_precision = 0
-    total_ndcg = 0
-    for idx in range(len(data)):
-        total_precision += precision_at_k(idx, cosine_sim, data, k)
-        total_ndcg += ndcg_at_k(idx, cosine_sim, data, k)
-    avg_precision = total_precision / len(data)
-    avg_ndcg = total_ndcg / len(data)
-    runtime = time.time() - start
-    return avg_precision, avg_ndcg, runtime
-
-
-# ==========================================
-# HELPER UI GAMBAR (DIREVISI UNTUK ASPEK RASIO)
+# HELPER UI GAMBAR
 # ==========================================
 
 def show_image(url, width=120):
-    # Mengunci tinggi gambar berdasarkan lebar untuk proporsi 2:3 yang seragam
     height = int(width * 1.5) 
     placeholder = "https://images.unsplash.com/photo-1543002588-bfa74002ed7e?q=80&w=200&auto=format&fit=crop"
     
@@ -250,22 +221,23 @@ def show_image(url, width=120):
 
 
 # ==========================================
-# TAMPILAN APLIKASI
+# START APLIKASI
 # ==========================================
 
-data = load_data()
-cosine_sim = build_model(data)
+train_data, test_data = load_and_preprocess_data()
+cosine_sim = build_model(train_data, test_data)
 
 st.title("📚 Sistem Rekomendasi Buku")
 
-tab_utama, tab_evaluasi = st.tabs(["🏠 Beranda & Pencarian", "📊 About & Evaluasi Sistem"])
+tab_utama, tab_about = st.tabs(["🏠 Beranda & Pencarian", "📌 About"])
 
 with tab_utama:
-    st.write("Cari buku favoritmu dan temukan rekomendasi termirip")
+    st.write("Cari buku favoritmu untuk mendapatkan rekomendasi buku yang serupa.")
 
     col_input1, col_input2, col_btn = st.columns([3, 1, 1])
     with col_input1:
-        judul_list = sorted(data['title'].dropna().unique().tolist())
+        # Menampilkan judul hanya dari Data Uji (Test Data)
+        judul_list = sorted(test_data['title'].dropna().unique().tolist())
         judul = st.selectbox("Pilih Judul Buku", [""] + judul_list, index=0)
     with col_input2:
         k = st.selectbox("Top-K", [3, 5, 10], index=0)
@@ -274,17 +246,24 @@ with tab_utama:
         st.write("")
         cari = st.button("🔍 Cari", use_container_width=True)
 
-    if cari and judul != "":
-        hasil = rekomendasi(judul, data, cosine_sim, k)
-        if hasil is None:
-            st.error("Judul buku tidak ditemukan")
+    if cari:
+        # Tambahan agar ada peringatan jika judul kosong (belum dipilih)
+        if judul == "":
+            st.warning("⚠️ Silakan pilih judul buku terlebih dahulu!")
         else:
-            idx, rekom = hasil
-            st.session_state.search_result_data = {"idx": idx, "rekom": rekom}
-            st.session_state.view_mode = "search_result"
-            if idx in st.session_state.history:
-                st.session_state.history.remove(idx)
-            st.session_state.history.insert(0, idx)
+            hasil = rekomendasi(judul, train_data, test_data, cosine_sim, k)
+            if hasil is None:
+                st.error("Judul buku tidak ditemukan.")
+            else:
+                idx, rekom = hasil
+                st.session_state.search_result_data = {"idx": idx, "rekom": rekom}
+                st.session_state.view_mode = "search_result"
+                
+                # Record history
+                hist_item = {"source": "test", "idx": idx}
+                if hist_item in st.session_state.history:
+                    st.session_state.history.remove(hist_item)
+                st.session_state.history.insert(0, hist_item)
 
     st.markdown("---")
 
@@ -294,8 +273,12 @@ with tab_utama:
 
     if st.session_state.view_mode == "detail":
         st.button("⬅ Kembali", on_click=set_home_view)
-        idx_detail = st.session_state.detail_idx
-        book = data.loc[idx_detail]
+        
+        detail_info = st.session_state.detail_item
+        if detail_info["source"] == "train":
+            book = train_data.loc[detail_info["idx"]]
+        else:
+            book = test_data.loc[detail_info["idx"]]
         
         st.subheader("📖 Detail Buku")
         col_img, col_desc = st.columns([1, 4])
@@ -314,7 +297,8 @@ with tab_utama:
         st.button("⬅ Kembali ke Beranda", on_click=set_home_view)
         res_idx = st.session_state.search_result_data["idx"]
         rekom_list = st.session_state.search_result_data["rekom"]
-        buku_dicari = data.loc[res_idx]
+        
+        buku_dicari = test_data.loc[res_idx] # Buku dari test_data
         
         st.subheader("📖 Buku Yang Dipilih")
         col_img, col_desc = st.columns([1, 4])
@@ -341,8 +325,9 @@ with tab_utama:
                 st.markdown(f"<div class='book-title'>{buku['Judul']}</div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='book-author'>{buku['Penulis']}</div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='book-rating'>⭐ {buku['Rating']}</div>", unsafe_allow_html=True)
+                # Tombol mereferensikan indeks dari train_data
                 st.button("Lihat Detail", key=f"rekom_{buku['Index']}", 
-                          on_click=set_detail_view, args=(buku['Index'],), use_container_width=True)
+                          on_click=set_detail_view, args=("train", buku['Index']), use_container_width=True)
 
     else:
         # ==================================
@@ -350,7 +335,7 @@ with tab_utama:
         # ==================================
         
         st.subheader("🌟 Top Populer")
-        top_populer = data.sort_values(by='ratings_count', ascending=False).head(6)
+        top_populer = train_data.sort_values(by='ratings_count', ascending=False).head(6)
         cols_pop = st.columns(min(len(top_populer), 6))
         for i, (idx_pop, row_pop) in enumerate(top_populer.iterrows()):
             with cols_pop[i]:
@@ -359,7 +344,7 @@ with tab_utama:
                 st.markdown(f"<div class='book-author'>{row_pop['authors']}</div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='book-rating'>⭐ {row_pop['average_rating']}</div>", unsafe_allow_html=True)
                 st.button("Lihat Detail", key=f"pop_{idx_pop}_{i}", 
-                          on_click=set_detail_view, args=(idx_pop,), use_container_width=True)
+                          on_click=set_detail_view, args=("train", idx_pop), use_container_width=True)
 
         st.divider()
 
@@ -368,53 +353,26 @@ with tab_utama:
             st.info("Belum ada riwayat. Silakan cari dan pilih judul buku di atas.")
         else:
             cols_hist = st.columns(min(len(st.session_state.history), 6))
-            for i, hist_idx in enumerate(st.session_state.history):
-                row_hist = data.loc[hist_idx]
+            for i, hist_item in enumerate(st.session_state.history):
+                source = hist_item["source"]
+                idx_hist = hist_item["idx"]
+                row_hist = train_data.loc[idx_hist] if source == "train" else test_data.loc[idx_hist]
+                
                 with cols_hist[i]:
                     show_image(row_hist["thumbnail"], width=120)
                     st.markdown(f"<div class='book-title'>{row_hist['title']}</div>", unsafe_allow_html=True)
                     st.markdown(f"<div class='book-author'>{row_hist['authors']}</div>", unsafe_allow_html=True)
                     st.markdown(f"<div class='book-rating'>⭐ {row_hist['average_rating']}</div>", unsafe_allow_html=True)
-                    st.button("Lihat Detail", key=f"hist_{hist_idx}_{i}", 
-                              on_click=set_detail_view, args=(hist_idx,), use_container_width=True)
+                    st.button("Lihat Detail", key=f"hist_{source}_{idx_hist}_{i}", 
+                              on_click=set_detail_view, args=(source, idx_hist), use_container_width=True)
 
 
 # ==========================================
-# TAB ABOUT & EVALUASI
+# TAB ABOUT 
 # ==========================================
 
-with tab_evaluasi:
+with tab_about:
     st.header("📌 About")
-    st.write("Sistem rekomendasi buku ini menggunakan metode **Content Based Filtering** (membandingkan kesamaan konten) dengan algoritma **TF-IDF Vectorizer** dan mengukur kemiripannya menggunakan **Cosine Similarity**.")
-    st.markdown("---")
-    st.header("📊 Evaluasi Sistem")
-    st.write("Evaluasi dihitung menggunakan metrik Precision@K dan NDCG@K untuk melihat seberapa relevan kategori buku yang direkomendasikan dengan kategori buku asal.")
-
-    if st.button("Jalankan Evaluasi Sistem"):
-        with st.spinner("Sedang memproses evaluasi (mungkin memakan waktu)..."):
-            p3, n3, t3 = evaluasi_sistem(data, cosine_sim, 3)
-            p5, n5, t5 = evaluasi_sistem(data, cosine_sim, 5)
-            p10, n10, t10 = evaluasi_sistem(data, cosine_sim, 10)
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Precision@3", round(p3, 3))
-        col2.metric("NDCG@3", round(n3, 3))
-        col3.metric("Runtime", f"{round(t3, 3)} detik")
-
-        hasil_eval = pd.DataFrame({
-            "K": [3, 5, 10],
-            "Precision": [p3, p5, p10],
-            "NDCG": [n3, n5, n10]
-        })
-
-        st.subheader("Tabel Evaluasi")
-        st.dataframe(hasil_eval, use_container_width=True)
-
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(hasil_eval["K"], hasil_eval["Precision"], marker="o", label="Precision")
-        ax.plot(hasil_eval["K"], hasil_eval["NDCG"], marker="o", label="NDCG")
-        ax.set_xlabel("Nilai K")
-        ax.set_ylabel("Skor")
-        ax.set_title("Perbandingan Precision dan NDCG")
-        ax.legend()
-        st.pyplot(fig)
+    st.write("Sistem rekomendasi buku ini menggunakan metode Content Based Filtering dengan logik pembagian data latih (80%) dan uji (20%).")
+    st.write("Algoritma yang digunakan adalah TF-IDF Vectorizer dipadukan dengan Cosine Similarity.")
+    st.write(f"Jumlah Data Latih: {len(train_data)} | Jumlah Data Uji: {len(test_data)}")
